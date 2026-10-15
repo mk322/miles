@@ -8,11 +8,19 @@ from miles.backends.training_utils.data.context_parallel import (
     allgather_cp_redistribute,
     iter_local_response_rows,
 )
-from miles.backends.training_utils.data.sampling_mask import build_local_sampling_mask
-from miles.backends.training_utils.loss.hub.math_utils import calculate_log_probs_and_entropy
+from miles.backends.training_utils.data.sampling_mask import (
+    build_local_sampling_mask,
+    get_rollout_sampling_masks,
+    rollout_topk_candidate_ids,
+)
+from miles.backends.training_utils.loss.hub.math_utils import (
+    calculate_log_probs_and_entropy,
+    true_on_policy_full_log_probs,
+)
 from miles.backends.training_utils.loss.hub.score_centering import selected_log_probs_and_entropy
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.sampling_mask import RolloutSamplingMask
+from miles.utils.types import RolloutBatch
 
 
 def _flatten_logits(logits: torch.Tensor, qkv_format: str, max_seq_lens: list[int] | None) -> torch.Tensor:
@@ -218,6 +226,67 @@ def get_log_probs_and_entropy(
         )
 
     return res
+
+
+def get_rollout_topk_mismatch(
+    logits: torch.Tensor, *, args: Namespace, batch: RolloutBatch
+) -> dict[str, list[torch.Tensor]]:
+    """Compare the rollout's recorded top-k candidates with the trainer's distribution, per response row.
+
+    The trainer side is the true-on-policy scoring (full-vocabulary ``log_softmax`` of the same logits,
+    with the replayed sampling support applied), so on-policy candidates match it bitwise:
+
+    - ``topk_logprob_abs_diff``: max over recorded candidates of ``|trainer - rollout|`` log-prob.
+    - ``topk_set_mismatch``: 1 when the recorded candidate log-probs, sorted descending, differ from the
+      trainer's top-k values. Comparing values rather than ids keeps tie order out of it.
+
+    Rows outside the loss mask (multi-turn observations, which carry no candidates) are 0.
+    """
+    assert args.true_on_policy_mode, "the rollout top-k candidate check scores with the true-on-policy math"
+    parallel_state = get_parallel_state()
+    sampling_masks = get_rollout_sampling_masks(batch) if args.use_sampling_support_replay else None
+    result = {"topk_logprob_abs_diff": [], "topk_set_mismatch": []}
+    chunks = _iter_response_chunks(
+        logits,
+        args=args,
+        unconcat_tokens=batch["unconcat_tokens"],
+        total_lengths=batch["total_lengths"],
+        response_lengths=batch["response_lengths"],
+        max_seq_lens=batch.get("max_seq_lens"),
+        include_response_indices=True,
+    )
+    for i, (chunk, _, indices) in enumerate(chunks):
+        indices = torch.as_tensor(list(indices), dtype=torch.long)
+        sampling_mask = None
+        if sampling_masks is not None:
+            sampling_mask = build_local_sampling_mask(
+                chunk, sampling_masks[i], indices, tp_rank=parallel_state.tp.rank
+            )
+        trainer = true_on_policy_full_log_probs(
+            chunk, parallel_state.tp.group, vocab_size=getattr(args, "vocab_size", None), sampling_mask=sampling_mask
+        )
+        ids = rollout_topk_candidate_ids(batch, i, indices).to(chunk.device)
+        rollout = torch.as_tensor(batch["rollout_topk_log_probs"][i])[indices].to(chunk.device)
+        active = torch.as_tensor(batch["loss_masks"][i])[indices].to(chunk.device).bool()
+        candidates = trainer.gather(-1, ids.clamp_min(0)).float()
+        # equal infinities (a candidate outside the support) are a match, not a NaN
+        diff = torch.where(candidates == rollout, 0.0, (candidates - rollout).abs())
+        abs_diff = torch.where(ids >= 0, diff, 0.0).amax(dim=-1)
+        expected = trainer.topk(ids.size(-1), dim=-1).values.float()
+        set_mismatch = (rollout.sort(dim=-1, descending=True).values != expected).any(dim=-1).float()
+        result["topk_logprob_abs_diff"].append(torch.where(active, abs_diff, 0.0))
+        result["topk_set_mismatch"].append(torch.where(active, set_mismatch, 0.0))
+
+    if args.allgather_cp:
+        allgather_cp_redistribute(
+            result,
+            logits=logits,
+            args=args,
+            total_lengths=batch["total_lengths"],
+            response_lengths=batch["response_lengths"],
+            max_seq_lens=batch.get("max_seq_lens"),
+        )
+    return result
 
 
 def _torch_log_probs_and_entropy(
