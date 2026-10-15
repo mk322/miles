@@ -26,9 +26,10 @@ def single_rank(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def _args() -> Namespace:
+def _args(log_probs_chunk_size: int = -1) -> Namespace:
     return Namespace(
         true_on_policy_mode=True,
+        log_probs_chunk_size=log_probs_chunk_size,
         use_sampling_support_replay=False,
         rollout_temperature=1.0,
         qkv_format="thd",
@@ -63,8 +64,10 @@ def _sampler_candidates(logits: torch.Tensor, k: int = K) -> tuple[np.ndarray, n
     return top.indices.numpy().astype(np.int32), top.values.numpy()
 
 
-def _check(logits: torch.Tensor, ids: np.ndarray, logps: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
-    result = get_rollout_topk_mismatch(logits, args=_args(), batch=_batch(ids, logps))
+def _check(
+    logits: torch.Tensor, ids: np.ndarray, logps: np.ndarray, log_probs_chunk_size: int = -1
+) -> tuple[torch.Tensor, torch.Tensor]:
+    result = get_rollout_topk_mismatch(logits, args=_args(log_probs_chunk_size), batch=_batch(ids, logps))
     (abs_diff,), (set_mismatch,) = result["topk_logprob_abs_diff"], result["topk_set_mismatch"]
     return abs_diff, set_mismatch
 
@@ -83,11 +86,13 @@ def test_tie_order_does_not_matter() -> None:
     assert abs_diff.sum() == 0 and set_mismatch.sum() == 0
 
 
-def test_perturbed_candidate_log_prob_is_reported() -> None:
+# 3 splits the 4 response rows unevenly; row 1 lands in the first chunk, row 3 alone in the second
+@pytest.mark.parametrize("log_probs_chunk_size", [-1, 3])
+def test_perturbed_candidate_log_prob_is_reported(log_probs_chunk_size: int) -> None:
     logits = _logits()
     ids, logps = _sampler_candidates(logits)
     logps[1, 2] += 1e-3
-    abs_diff, set_mismatch = _check(logits, ids, logps)
+    abs_diff, set_mismatch = _check(logits, ids, logps, log_probs_chunk_size)
     assert abs_diff[1] == pytest.approx(1e-3, rel=1e-3)
     assert set_mismatch.tolist() == [0.0, 1.0, 0.0, 0.0]
     assert abs_diff[[0, 2, 3]].tolist() == [0.0, 0.0, 0.0]

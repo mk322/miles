@@ -2,6 +2,7 @@ from argparse import Namespace
 from collections.abc import Iterator, Sequence
 
 import torch
+import torch.distributed as dist
 
 from miles.backends.training_utils.data.context_parallel import (
     LocalResponseRows,
@@ -262,18 +263,26 @@ def get_rollout_topk_mismatch(
             sampling_mask = build_local_sampling_mask(
                 chunk, sampling_masks[i], indices, tp_rank=parallel_state.tp.rank
             )
-        trainer = true_on_policy_full_log_probs(
-            chunk, parallel_state.tp.group, vocab_size=getattr(args, "vocab_size", None), sampling_mask=sampling_mask
-        )
         ids = rollout_topk_candidate_ids(batch, i, indices).to(chunk.device)
         rollout = torch.as_tensor(batch["rollout_topk_log_probs"][i])[indices].to(chunk.device)
         active = torch.as_tensor(batch["loss_masks"][i])[indices].to(chunk.device).bool()
-        candidates = trainer.gather(-1, ids.clamp_min(0)).float()
-        # equal infinities (a candidate outside the support) are a match, not a NaN
-        diff = torch.where(candidates == rollout, 0.0, (candidates - rollout).abs())
-        abs_diff = torch.where(ids >= 0, diff, 0.0).amax(dim=-1)
-        expected = trainer.topk(ids.size(-1), dim=-1).values.float()
-        set_mismatch = (rollout.sort(dim=-1, descending=True).values != expected).any(dim=-1).float()
+        # Row chunks bound the [rows, V] log-softmax, split like the true-on-policy scoring splits its rows.
+        rows = args.log_probs_chunk_size if args.log_probs_chunk_size > 0 else max(len(indices), 1)
+        abs_diffs, set_mismatches = [], []
+        # At least one call: a rank with no local rows still joins the TP vocab gather.
+        for start in range(0, max(len(indices), 1), rows):
+            part = slice(start, start + rows)
+            abs_diff, set_mismatch = _rollout_topk_mismatch_rows(
+                chunk[part],
+                ids[part],
+                rollout[part],
+                tp_group=parallel_state.tp.group,
+                vocab_size=getattr(args, "vocab_size", None),
+                sampling_mask=None if sampling_mask is None else sampling_mask[part],
+            )
+            abs_diffs.append(abs_diff)
+            set_mismatches.append(set_mismatch)
+        abs_diff, set_mismatch = torch.cat(abs_diffs), torch.cat(set_mismatches)
         result["topk_logprob_abs_diff"].append(torch.where(active, abs_diff, 0.0))
         result["topk_set_mismatch"].append(torch.where(active, set_mismatch, 0.0))
 
@@ -287,6 +296,26 @@ def get_rollout_topk_mismatch(
             max_seq_lens=batch.get("max_seq_lens"),
         )
     return result
+
+
+def _rollout_topk_mismatch_rows(
+    logits: torch.Tensor,
+    ids: torch.Tensor,
+    rollout: torch.Tensor,
+    *,
+    tp_group: dist.ProcessGroup | None,
+    vocab_size: int | None,
+    sampling_mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-row ``(abs_diff, set_mismatch)`` of rollout candidates against the trainer; see get_rollout_topk_mismatch."""
+    trainer = true_on_policy_full_log_probs(logits, tp_group, vocab_size=vocab_size, sampling_mask=sampling_mask)
+    candidates = trainer.gather(-1, ids.clamp_min(0)).float()
+    # equal infinities (a candidate outside the support) are a match, not a NaN
+    diff = torch.where(candidates == rollout, 0.0, (candidates - rollout).abs())
+    abs_diff = torch.where(ids >= 0, diff, 0.0).amax(dim=-1)
+    expected = trainer.topk(ids.size(-1), dim=-1).values.float()
+    set_mismatch = (rollout.sort(dim=-1, descending=True).values != expected).any(dim=-1).float()
+    return abs_diff, set_mismatch
 
 
 def _torch_log_probs_and_entropy(
