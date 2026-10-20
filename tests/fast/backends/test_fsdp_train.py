@@ -54,6 +54,7 @@ def test_only_the_actor_pass_scores_replay_rollout_sampling_support(
 ):
     actor = object.__new__(actor_module.FSDPTrainRayActor)
     actor.args = Namespace(
+        ci_test=False,
         use_sampling_support_replay=use_sampling_support_replay,
         data_pad_size_multiplier=1,
         qkv_format="thd",
