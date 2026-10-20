@@ -228,6 +228,16 @@ def test_zero_token_completion_accepts_missing_candidate_fields(mode: str) -> No
     assert sample.rollout_topk_log_probs.shape == (0, 3)
 
 
+@pytest.mark.parametrize("width", [0, 3], ids=["empty-width", "full-width"])
+def test_zero_token_completion_accepts_empty_flat_candidates(width: int) -> None:
+    # an empty flat response has no rows to be short of, whatever width it reports
+    flat = _flat_output_top_logprobs([]) | {"output_top_logprobs_shape": [0, width]}
+    sample = Sample(response_length=0)
+    append_rollout_topk_logprobs(sample, {"output_token_logprobs": [], **flat}, 3)
+    assert sample.rollout_topk_token_ids.shape == (0, 3)
+    assert sample.rollout_topk_log_probs.shape == (0, 3)
+
+
 @pytest.mark.parametrize("support", [False, True])
 @pytest.mark.parametrize("candidates", [[2, 2, -1], [-1, 3, 3], [2, 3, 2]])
 def test_duplicate_candidates_are_rejected(support: bool, candidates: list[int]) -> None:

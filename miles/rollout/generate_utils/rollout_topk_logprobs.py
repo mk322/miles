@@ -69,7 +69,7 @@ def append_rollout_topk_logprobs(
         flat_ids, flat_logps = _decode_flat_output_top_logprobs(meta)
         if len(flat_ids) != n:
             raise ValueError(f"Rollout top-k logprobs collection requires SGLang {field} for every generated token")
-        if flat_ids.shape[1] < k:
+        if n and flat_ids.shape[1] < k:
             # e.g. a router capping top_logprobs; padding would silently shrink the candidate set
             raise ValueError(
                 f"SGLang returned {flat_ids.shape[1]} {field} per token, fewer than --rollout-top-logprobs-num {k}"
