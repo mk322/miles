@@ -5,6 +5,8 @@ import torch
 from miles import platforms
 from miles.backends.fsdp_utils.arguments import FSDPArgs, build_dataclass_parser, load_args_from_parser
 
+_TPU_ATTENTION_BACKENDS = ("sdpa_blocks", "splash")
+
 
 @dataclass
 class TorchtitanArgs(FSDPArgs):
@@ -22,6 +24,8 @@ class TorchtitanArgs(FSDPArgs):
     titan_compile: bool = False
     # all-gather FSDP params once per pass and reduce-scatter once per step; holds full params and grads
     titan_fsdp_gather_once: bool = False
+    # packed-document attention on TPU: "sdpa_blocks" (query blocks over SDPA) or "splash" (Pallas kernel)
+    titan_tpu_attention: str = "sdpa_blocks"
 
 
 def build_torchtitan_parser(extra_args_provider=None):
@@ -54,6 +58,17 @@ def validate_torchtitan_args(args) -> None:
             "inside the rope kernel"
         )
 
+    if args.titan_tpu_attention not in _TPU_ATTENTION_BACKENDS:
+        raise ValueError(
+            f"--titan-tpu-attention {args.titan_tpu_attention!r}: expected one of {_TPU_ATTENTION_BACKENDS}"
+        )
+    if args.titan_tpu_attention != "sdpa_blocks" and not platforms.IS_TPU:
+        raise ValueError(f"--titan-tpu-attention {args.titan_tpu_attention} applies on TPU only")
+    if args.titan_tpu_attention == "splash" and args.seq_length % 1024:
+        raise ValueError(
+            f"--titan-tpu-attention splash tiles the sequence in 1024-token blocks; --seq-length {args.seq_length} "
+            "is not a multiple of 1024"
+        )
     if platforms.IS_TPU and args.log_probs_backend == "fused":
         raise ValueError("--log-probs-backend fused is a Triton kernel; on TPU use --log-probs-backend torch")
     # without dynamic shapes, packed microbatches are padded to a power-of-two bucket capped at --seq-length
