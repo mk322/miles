@@ -146,7 +146,6 @@ def collect_eval_sglang_overrides(args) -> dict:
 
 
 def sglang_attention_dp_enabled(args) -> bool:
-    # `--dp-size N --enable-dp-attention` is the deprecated spelling of `--attn-dp-size N`
     return args.sglang_attn_dp_size > 1 or (args.sglang_enable_dp_attention and args.sglang_dp_size > 1)
 
 
