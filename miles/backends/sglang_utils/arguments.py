@@ -208,7 +208,7 @@ def validate_args(args):
     if args.sglang_dp_size > 1:
         assert args.sglang_enable_dp_attention
 
-    if args.sglang_enable_dp_attention:
+    if sglang_attention_dp_enabled(args):
         args.router_dp_aware = True
 
     if args.sglang_router_policy is None and args.use_session_server:
