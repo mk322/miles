@@ -42,6 +42,11 @@ Args:
   --clip-grad / --weight-decay: default to the paper's 8B values 1.0 / 0.04.
   --num-epoch: passes over the data (OTA: 7).
   --attention-backend: Megatron attention backend (default flash; on A100 use docker/Dockerfile.sm80).
+  --data-file: the jsonl under --data-dir (default the LF-parity ota_sft_10k.jsonl).
+  --sft-tree-attention: train every assistant turn against its inference prompt (stock chat template,
+      earlier turns think-stripped) with tree packing; see miles/rollout/sft_tree.py. Needs
+      --chat-template, the template the eval server uses (an exported checkpoint's chat_template.jinja).
+      A step still consumes --global-batch-size traces, however many trees they become.
 
 =====================
 
@@ -50,6 +55,10 @@ Args:
   python examples/ota_sft/run_qwen3_8b_ota_sft.py train --finetune-type full
   # 4x A100 80GB (tuned: ~144 s/step, 73 GB peak), via examples/ota_sft/docker_train.py:
   python examples/ota_sft/run_qwen3_8b_ota_sft.py train --finetune-type lora --recompute-method block --recompute-num-layers 22
+  # inference-aligned tree attention:
+  python examples/ota_sft/run_qwen3_8b_ota_sft.py train --finetune-type full --sft-tree-attention \
+      --data-file ota_sft_10k_aligned.jsonl --save-interval 104 \
+      --chat-template /root/shared_data/ota_lora_r64_lr4e-4/hf/step_664/chat_template.jinja
 """
 
 from dataclasses import dataclass
@@ -108,6 +117,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # On A100 TE picks flash-attn-4 (backward needs sm90+) and cuDNN fused rejects THD on sm80, so run the
     # docker/Dockerfile.sm80 image, which removes FA4 and leaves FA2.
     attention_backend: str = "flash"
+    data_file: str = _JSONL
+    sft_tree_attention: bool = False
+    chat_template: str | None = None
     extra_args: str = ""
 
     @property
@@ -159,7 +171,7 @@ def _train(args: ScriptArgs):
 
     sft_args = (
         "--rollout-function-path examples.ota_sft.ota_sft_rollout.generate_rollout "
-        f"--prompt-data {args.data_dir}/{_JSONL} "
+        f"--prompt-data {args.data_dir}/{args.data_file} "
         "--input-key messages "
         "--metadata-key metadata "
         f"--rollout-max-context-len {args.cutoff_len} "
@@ -172,6 +184,9 @@ def _train(args: ScriptArgs):
         "--disable-compute-advantages-and-returns "
         "--debug-train-only "
     )
+    if args.sft_tree_attention:
+        assert args.chat_template, "--sft-tree-attention needs --chat-template (the template inference serves)"
+        sft_args += f"--sft-tree-attention --sft-tree-chat-template {args.chat_template} "
 
     perf_args = (
         f"--tensor-model-parallel-size {tp_size} "

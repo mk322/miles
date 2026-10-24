@@ -26,11 +26,11 @@ import logging
 from collections import Counter
 from dataclasses import asdict
 
-from miles.rollout.sft_tree import build_trees, build_turn_samples
+from miles.rollout.sft_tree import TreeSample, build_trees, build_turn_samples, expand_tree
 from miles.utils.processing_utils import load_tokenizer
 from miles.utils.types import Sample
 
-__all__ = ["generate_rollout", "TARGET_SUFFIX"]
+__all__ = ["generate_rollout", "generate_rollout_expanded", "TARGET_SUFFIX"]
 
 logger = logging.getLogger(__name__)
 
@@ -97,62 +97,72 @@ def _load_chat_template(args, tokenizer) -> str:
     return template
 
 
-def _tree_samples(args, sample: Sample, stats: Counter) -> list[Sample]:
-    turns = build_turn_samples(
-        _TOKENIZER, sample.prompt, target_suffix=TARGET_SUFFIX, chat_template=_CHAT_TEMPLATE
-    )
+def _trees(args, sample: Sample, stats: Counter) -> list[TreeSample]:
+    turns = build_turn_samples(_TOKENIZER, sample.prompt, target_suffix=TARGET_SUFFIX, chat_template=_CHAT_TEMPLATE)
     max_tree_tokens = args.max_tokens_per_gpu if args.use_dynamic_batch_size else args.rollout_max_context_len
-    trees, tree_stats = build_trees(
-        turns, max_context_len=args.rollout_max_context_len, max_tree_tokens=max_tree_tokens
-    )
+    trees, tree_stats = build_trees(turns, max_context_len=args.rollout_max_context_len, max_tree_tokens=max_tree_tokens)
     stats.update(asdict(tree_stats))
+    # No trainable turn (all `loss: false`, or all longer than the context): the trace still occupies
+    # its slot of the step, as one fully masked sample that adds nothing to the loss or (under
+    # --sft-tree-attention) to the per-token normalizer.
+    stats["traces_without_trainable_turns"] += not trees
+    return trees
+
+
+def _sample(source: Sample, *, tokens, response_length, loss_mask, tree_branches=None) -> Sample:
+    return Sample(
+        group_index=source.group_index,
+        index=source.index,
+        # siblings of one trace: counted as one rollout by the step schedule and the loss
+        rollout_id=source.index,
+        prompt=source.prompt,
+        tokens=list(tokens),
+        response_length=response_length,
+        loss_mask=list(loss_mask),
+        tree_branches=tree_branches,
+        reward=0,
+        status=Sample.Status.COMPLETED,
+        metadata=source.metadata,
+    )
+
+
+def _placeholder_sample(source: Sample) -> Sample:
+    tokens = _TOKENIZER.encode("<|im_start|>user", add_special_tokens=False)
+    return _sample(source, tokens=tokens, response_length=1, loss_mask=[0])
+
+
+def _tree_samples(source: Sample, trees: list[TreeSample]) -> list[Sample]:
     if not trees:
-        # No trainable turn (all `loss: false`, or all longer than the context). The trace still
-        # occupies its slot of the step, as one fully masked sample that adds nothing to the loss or
-        # (under --sft-tree-attention) to the per-token normalizer.
-        stats["traces_without_trainable_turns"] += 1
-        return [_placeholder_sample(sample)]
+        return [_placeholder_sample(source)]
     return [
-        Sample(
-            group_index=sample.group_index,
-            index=sample.index,
-            # siblings of one trace: counted as one rollout by the step schedule and the loss
-            rollout_id=sample.index,
-            prompt=sample.prompt,
-            tokens=list(tree.tokens),
-            response_length=tree.response_length,
-            loss_mask=list(tree.loss_mask),
-            tree_branches=[list(b) for b in tree.branches],
-            reward=0,
-            status=Sample.Status.COMPLETED,
-            metadata=sample.metadata,
+        _sample(
+            source,
+            tokens=t.tokens,
+            response_length=t.response_length,
+            loss_mask=t.loss_mask,
+            tree_branches=[list(b) for b in t.branches],
         )
-        for tree in trees
+        for t in trees
     ]
 
 
-def _placeholder_sample(sample: Sample) -> Sample:
-    tokens = _TOKENIZER.encode("<|im_start|>user", add_special_tokens=False)
-    return Sample(
-        group_index=sample.group_index,
-        index=sample.index,
-        rollout_id=sample.index,
-        prompt=sample.prompt,
-        tokens=tokens,
-        response_length=1,
-        loss_mask=[0],
-        reward=0,
-        status=Sample.Status.COMPLETED,
-        metadata=sample.metadata,
-    )
+def _expanded_samples(source: Sample, trees: list[TreeSample]) -> list[Sample]:
+    if not trees:
+        return [_placeholder_sample(source)]
+    out = []
+    for tree in trees:
+        for tokens, mask in expand_tree(tree):
+            first = mask.index(1)
+            out.append(_sample(source, tokens=tokens, response_length=len(tokens) - first, loss_mask=mask[first:]))
+    return out
 
 
-def _generate_tree_rollout(args, samples) -> list:
+def _generate_tree_rollout(args, samples, to_samples=_tree_samples) -> list:
     global _CHAT_TEMPLATE
     if _CHAT_TEMPLATE is None:
         _CHAT_TEMPLATE = _load_chat_template(args, _TOKENIZER)
     stats = Counter()
-    out = [[_tree_samples(args, sample, stats)] for (sample,) in samples]
+    out = [[to_samples(sample, _trees(args, sample, stats))] for (sample,) in samples]
     logger.info(
         f"ota_sft_rollout (tree): {len(samples)} traces -> {stats['num_trees']} trees, "
         f"{stats['tree_tokens']} tokens (expanded {stats['expanded_tokens']}, "
@@ -162,6 +172,20 @@ def _generate_tree_rollout(args, samples) -> list:
         f"traces without a trainable turn {stats['traces_without_trainable_turns']}"
     )
     return out
+
+
+def generate_rollout_expanded(args, rollout_id, data_buffer, evaluation=False) -> list[Sample]:
+    """Verification only: the traces of the tree rollout as one standalone sample per turn.
+
+    Same steps, supervised tokens and per-token normalizer as the tree rollout, at ~5x the tokens.
+    Run it (with or without --sft-tree-attention) against the tree rollout to compare a step's loss
+    and grad norm; it still needs --sft-tree-chat-template.
+    """
+    assert not evaluation
+    global _TOKENIZER
+    if _TOKENIZER is None:
+        _TOKENIZER = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
+    return _generate_tree_rollout(args, data_buffer.get_samples(args.rollout_batch_size), _expanded_samples)
 
 
 def generate_rollout(args, rollout_id, data_buffer, evaluation=False) -> list[Sample]:
