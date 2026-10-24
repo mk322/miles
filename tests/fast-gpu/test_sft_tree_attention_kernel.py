@@ -20,7 +20,7 @@ import pytest
 import torch
 from flash_attn import flash_attn_varlen_func
 
-from miles.backends.megatron_utils.tree_attention import TreeAttentionLayout, apply_rope_fp32, tree_flash_attention
+from miles.backends.megatron_utils.tree_attention import TreeAttentionLayout, tree_flash_attention
 
 DEVICE = "cuda"
 
@@ -218,16 +218,35 @@ def test_layout_rejects_malformed_cross():
         TreeAttentionLayout.build((0, 10, 20), ((12, 20, 0, 5),), DEVICE)  # rows are not a segment
 
 
-def test_rope_fp32_matches_megatron_unfused_in_fp64():
-    from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
+@pytest.mark.parametrize("rope_fusion", [False, True])
+def test_rope_at_positions_is_bitwise_megatron_thd_rope(nccl_world, rope_fusion):
+    """Tree RoPE at explicit positions == Megatron's THD RoPE (positions restart per sequence), bit for bit."""
+    from megatron.core import parallel_state
+    from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
+    from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+    from megatron.core.transformer.transformer_config import TransformerConfig
 
-    torch.manual_seed(0)
-    t = torch.randn(257, 8, 128, device=DEVICE, dtype=torch.float64)
-    inv_freq = 1.0 / (1e6 ** (torch.arange(0, 128, 2, dtype=torch.float64, device=DEVICE) / 128))
-    pos = torch.randint(0, 32768, (257,), device=DEVICE).double()
-    freqs = torch.outer(pos, inv_freq)
-    freqs = torch.cat((freqs, freqs), dim=-1)
-    ours = apply_rope_fp32(t, freqs).double()
-    # apply_rope_fp32 computes in fp32; compare at fp32 resolution against Megatron's formula in fp64
-    theirs = _apply_rotary_pos_emb_bshd(t.unsqueeze(1), freqs[:, None, None, :]).squeeze(1)
-    torch.testing.assert_close(ours, theirs, rtol=1e-5, atol=1e-5)
+    from miles.backends.megatron_utils.tree_attention import apply_rope_at_positions
+
+    parallel_state.initialize_model_parallel(1)
+    try:
+        config = TransformerConfig(
+            num_layers=1, hidden_size=1024, num_attention_heads=8, kv_channels=128, apply_rope_fusion=rope_fusion
+        )
+        rotary = RotaryEmbedding(kv_channels=128, rotary_percent=1.0, rotary_base=1000000)
+        lens = [300, 5000, 1]
+        cu = torch.tensor([0, 300, 5300, 5301], dtype=torch.int32, device=DEVICE)
+        torch.manual_seed(0)
+        t = torch.randn(sum(lens), 8, 128, device=DEVICE, dtype=torch.bfloat16)
+        cp = parallel_state.get_context_parallel_group()
+        emb = rotary(5000, packed_seq=True)
+        theirs = apply_rotary_pos_emb(t, emb, config=config, cu_seqlens=cu, cp_group=cp, max_seqlen=5000)
+        positions = torch.cat([torch.arange(n) for n in lens]).to(DEVICE)
+        assert torch.equal(apply_rope_at_positions(t, rotary, positions, 4999, config), theirs)
+        # a branch starting mid-sequence rotates exactly like those positions inside the full sequence
+        branch = apply_rope_at_positions(t[4300:4310], rotary, torch.arange(4000, 4010, device=DEVICE), 4999, config)
+        assert torch.equal(branch, theirs[4300:4310])
+    finally:
+        parallel_state.destroy_model_parallel()
+
+

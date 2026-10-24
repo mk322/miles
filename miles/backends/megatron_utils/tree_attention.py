@@ -17,15 +17,18 @@ gradient of each key subset the gradient of the full softmax (the ring-attention
 
 RoPE: the tree's position ids are not a function of ``cu_seqlens`` (a branch restarts at its attach
 point, not at 0), so in tree mode the model-level RoPE is switched off and ``TreeCoreAttention``
-rotates q and k itself, in fp32, from explicit per-token position ids.
+rotates q and k itself at explicit per-token position ids, through Megatron's own RoPE function
+(bit-identical to the existing THD RoPE at the same positions, fused or not).
 """
 
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 
 import torch
 from flash_attn.flash_attn_interface import _flash_attn_varlen_backward, _flash_attn_varlen_forward
+from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.attention import SelfAttention
 
@@ -197,21 +200,18 @@ def tree_flash_attention(
     return _TreeFlashAttention.apply(q, k, v, layout, softmax_scale, deterministic)
 
 
-def apply_rope_fp32(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    """Non-interleaved RoPE of ``t [T, H, D]`` with per-token angles ``freqs [T, D_rot]``, computed in fp32.
+def apply_rope_at_positions(
+    t: torch.Tensor, rotary_emb: torch.nn.Module, positions: torch.Tensor, max_position: int, config
+) -> torch.Tensor:
+    """RoPE of THD ``t [T, H, D]`` at explicit per-token ``positions``.
 
-    Matches Megatron's ``_apply_rotary_pos_emb_bshd`` (rotate-half, rotary dims first, pass-through
-    tail) except that the multiply-add runs in fp32 and rounds once, as TE's fused RoPE does.
+    The angles of every token are gathered from the model's ``RotaryEmbedding`` and applied through
+    Megatron's own ``apply_rotary_pos_emb`` in its sbhd form (``s = T``, ``b = 1``), fused or not as
+    ``config.apply_rope_fusion`` says: the same arithmetic, bit for bit, as the THD RoPE of the
+    existing path at the same positions.
     """
-    rot_dim = freqs.shape[-1]
-    t_rot, t_pass = t[..., :rot_dim], t[..., rot_dim:]
-    x = t_rot.float()
-    cos = torch.cos(freqs).unsqueeze(1)
-    sin = torch.sin(freqs).unsqueeze(1)
-    x1, x2 = torch.chunk(x, 2, dim=-1)
-    rotated = torch.cat((-x2, x1), dim=-1)
-    out = (x * cos + rotated * sin).to(t.dtype)
-    return torch.cat((out, t_pass), dim=-1) if t_pass.shape[-1] else out
+    freqs = rotary_emb.get_emb(max_position + 1)[positions]  # [T, 1, 1, D_rot]
+    return apply_rotary_pos_emb(t.unsqueeze(1), freqs, config=config).squeeze(1)
 
 
 class TreeCoreAttention(torch.nn.Module):
@@ -221,13 +221,17 @@ class TreeCoreAttention(torch.nn.Module):
     of positions ``[0, n)`` as ``[n, 1, 1, D_rot]``, before any CP sharding.
     """
 
-    def __init__(self, *, rotary_emb: torch.nn.Module, softmax_scale: float, deterministic: bool):
+    def __init__(self, *, config, rotary_emb: torch.nn.Module, softmax_scale: float):
         super().__init__()
-        assert not rotary_emb.rotary_interleaved, "tree attention implements rotate-half RoPE only"
-        # a plain attribute, not a submodule: it is the model's own and owns no parameters
+        # plain attributes, not submodules: the model owns them, and neither has parameters
         object.__setattr__(self, "_rotary_emb", rotary_emb)
+        object.__setattr__(self, "_config", config)
         self.softmax_scale = softmax_scale
-        self.deterministic = deterministic
+        # flash-attn's backward is deterministic only on request; ask exactly when TE would
+        self.deterministic = (
+            not bool(int(os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")))
+            or torch.are_deterministic_algorithms_enabled()
+        )
 
     def forward(
         self,
@@ -246,10 +250,9 @@ class TreeCoreAttention(torch.nn.Module):
         assert attention_bias is None
         positions = packed_seq_params.position_ids
         assert query.shape[0] == positions.shape[0], f"{query.shape} vs {positions.shape}"
-        angles = self._rotary_emb.get_emb(packed_seq_params.max_position + 1)
-        freqs = angles.view(angles.shape[0], angles.shape[-1])[positions]
-        query = apply_rope_fp32(query, freqs).contiguous()
-        key = apply_rope_fp32(key, freqs).contiguous()
+        max_position = packed_seq_params.max_position
+        query = apply_rope_at_positions(query, self._rotary_emb, positions, max_position, self._config).contiguous()
+        key = apply_rope_at_positions(key, self._rotary_emb, positions, max_position, self._config).contiguous()
         out = tree_flash_attention(
             query,
             key,
@@ -296,8 +299,9 @@ def install_tree_attention(model: torch.nn.Module) -> None:
     for name, module in model.named_modules():
         if isinstance(module, SelfAttention):
             assert module.rotary_pos_emb is None, f"{name}: per-layer RoPE is not supported"
+            assert module._yarn_concentration_factor == 1.0, f"{name}: RoPE mscale is not supported"
             module.core_attention = TreeCoreAttention(
-                rotary_emb=rotary_emb, softmax_scale=softmax_scale, deterministic=config.deterministic_mode
+                config=module.config, rotary_emb=rotary_emb, softmax_scale=softmax_scale
             )
             count += 1
     assert count == len(model.decoder.layers), f"replaced {count} attentions for {len(model.decoder.layers)} layers"
