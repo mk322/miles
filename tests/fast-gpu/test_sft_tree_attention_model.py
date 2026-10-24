@@ -77,7 +77,16 @@ def _set_miles_parallel_state() -> None:
     )
 
 
-def _config(tp: int, *, rope_fusion: bool, fp32: bool = False) -> TransformerConfig:
+_RECOMPUTE = {
+    "none": {},
+    # the first layers fully recomputed, the rest not (the LoRA recipe's --recompute-method block)
+    "block": dict(recompute_granularity="full", recompute_method="block", recompute_num_layers=1),
+    # every layer recomputed (the full-FT recipe's default --recompute-method uniform)
+    "uniform": dict(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1),
+}
+
+
+def _config(tp: int, *, rope_fusion: bool, fp32: bool = False, recompute: str = "block") -> TransformerConfig:
     return TransformerConfig(
         num_layers=LAYERS,
         hidden_size=256,
@@ -101,9 +110,7 @@ def _config(tp: int, *, rope_fusion: bool, fp32: bool = False) -> TransformerCon
         apply_rope_fusion=rope_fusion,
         calculate_per_token_loss=True,
         variable_seq_lengths=True,
-        recompute_granularity="full",
-        recompute_method="block",
-        recompute_num_layers=1,
+        **_RECOMPUTE[recompute],
     )
 
 
@@ -284,6 +291,9 @@ def run(tp: int):
         base, tree_model = _model(_config(tp, rope_fusion=rope_fusion)), _model(_config(tp, rope_fusion=rope_fusion))
         tree_model.load_state_dict(base.state_dict())
         install_tree_attention(tree_model)
+        # same parameters and checkpoint keys as the existing path: checkpoints load either way
+        assert list(tree_model.state_dict()) == list(base.state_dict())
+        assert [n for n, _ in tree_model.named_parameters()] == [n for n, _ in base.named_parameters()]
         mbs = [list(range(len(single)))]
         lp_a, loss_a, n_a, g_a = _step(base, _args(False), single, mbs)
         lp_b, loss_b, n_b, g_b = _step(tree_model, _args(True), single, mbs)
@@ -293,14 +303,17 @@ def run(tp: int):
         assert diff == 0 and gdiff == 0 and loss_a == loss_b and n_a == n_b, report
 
     # --- bf16, production kernels: trees through tree attention vs expanded samples through the existing path
-    base, tree_model = _model(_config(tp, rope_fusion=True)), _model(_config(tp, rope_fusion=True))
-    tree_model.load_state_dict(base.state_dict())
-    install_tree_attention(tree_model)
-    bf16 = _compare(base, _args(False), tree_model, tree_samples, expanded)
-    report["bf16"] = bf16
-    assert abs(bf16["loss_tree"] - bf16["loss_expanded"]) <= 1e-4 * abs(bf16["loss_expanded"]), report
-    assert bf16["max_abs_logprob_diff"] <= 3 * bf16["max_abs_logprob_diff_noise_floor"] + 1e-2, report
-    assert bf16["max_grad_rel"] <= 3 * bf16["max_grad_rel_noise_floor"] + 1e-2, report
+    # under every recompute setting the recipes use (none, full block over some layers, full uniform)
+    for recompute in ("block", "none", "uniform"):
+        cfg = _config(tp, rope_fusion=True, recompute=recompute)
+        base, tree_model = _model(cfg), _model(cfg)
+        tree_model.load_state_dict(base.state_dict())
+        install_tree_attention(tree_model)
+        bf16 = _compare(base, _args(False), tree_model, tree_samples, expanded)
+        report[f"bf16_recompute={recompute}"] = bf16
+        assert abs(bf16["loss_tree"] - bf16["loss_expanded"]) <= 1e-4 * abs(bf16["loss_expanded"]), report
+        assert bf16["max_abs_logprob_diff"] <= 3 * bf16["max_abs_logprob_diff_noise_floor"] + 1e-2, report
+        assert bf16["max_grad_rel"] <= 3 * bf16["max_grad_rel_noise_floor"] + 1e-2, report
 
     # --- fp32 with exact (fp64 dense masked) attention in both: isolates the tree construction itself
     # (positions, masks, labels, normalization) from kernel rounding. The expanded samples run through

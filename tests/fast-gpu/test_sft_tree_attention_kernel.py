@@ -157,6 +157,24 @@ def test_random_trees_match_dense_reference(dtype, hq, hk, d, seed):
     _assert_as_accurate_as_expanded(*_run(cu, cross, hq, hk, d, dtype, seed=seed))
 
 
+@pytest.mark.parametrize("hq,hk,d", [(32, 8, 128), (8, 2, 128), (6, 2, 64)])
+@pytest.mark.parametrize("seed", [0, 1, 2, 3])
+def test_forward_is_bitwise_the_expanded_samples(hq, hk, d, seed):
+    """Every row (trunk, inline target, branch) equals its standalone sample's row bit for bit."""
+    rng = random.Random(100 + seed)
+    trees = _random_trees(rng, n_trees=rng.randint(1, 4), max_trunk=3000, max_branches=6, max_blen=700)
+    cu, cross = _random_layout(rng, trees, pad=rng.choice([0, 33]))
+    torch.manual_seed(seed)
+    T = cu[-1]
+    q = torch.randn(T, hq, d, device=DEVICE, dtype=torch.bfloat16)
+    k = torch.randn(T, hk, d, device=DEVICE, dtype=torch.bfloat16)
+    v = torch.randn(T, hk, d, device=DEVICE, dtype=torch.bfloat16)
+    scale = 1 / math.sqrt(d)
+    out = tree_flash_attention(q, k, v, TreeAttentionLayout.build(cu, cross, DEVICE), softmax_scale=scale)
+    expanded_out, *_ = _expanded_flash(q, k, v, torch.zeros_like(q), cu, cross, scale)
+    assert torch.equal(out, expanded_out)
+
+
 def test_long_tree_qwen3_heads():
     """A 16K-token tree with Qwen3-8B's head layout (32 q heads, 8 kv heads, head_dim 128)."""
     rng = random.Random(7)

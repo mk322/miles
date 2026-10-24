@@ -44,7 +44,6 @@ OUT = os.environ.get("TREE_OUT", "/root/dev/qwen3_8b_logprob_equivalence.json")
 # first TREE_TRUNCATE messages so dense attention fits; isolates the tree construction from bf16 noise
 FP32 = os.environ.get("TREE_PRECISION", "bf16") == "fp32"
 TRUNCATE = int(os.environ.get("TREE_TRUNCATE", "0"))
-PACK_BUDGET = int(os.environ.get("TREE_PACK_BUDGET", "32768"))
 SUFFIX = "<|im_end|>\n"
 
 
@@ -140,17 +139,15 @@ def _megatron_log_probs(model, args, samples: list[dict], micro_batches=None) ->
     return out
 
 
-def _pack(samples: list[dict], budget: int) -> list[list[int]]:
-    """Back-to-back micro-batches of up to ``budget`` tokens, in reverse order (another composition)."""
-    mbs, cur, size = [], [], 0
-    for i in reversed(range(len(samples))):
-        n = len(samples[i]["tokens"])
-        if cur and size + n > budget:
-            mbs.append(cur)
-            cur, size = [], 0
-        cur.append(i)
-        size += n
-    return mbs + [cur]
+def _with_fillers(samples: list[dict], filler_len: int = 777) -> tuple[list[dict], list[list[int]]]:
+    """Every sample in its own micro-batch behind a random filler sequence: same samples, other GEMM shapes."""
+    g = torch.Generator().manual_seed(0)
+    filler = {"tokens": torch.randint(0, 151936, (filler_len,), generator=g).tolist(), "response_length": 1, "loss_mask": [0]}
+    out, mbs = [], []
+    for s in samples:
+        mbs.append([len(out), len(out) + 1])
+        out += [filler, s]
+    return out, mbs
 
 
 @torch.no_grad()
@@ -248,11 +245,11 @@ def main():
         tree_attention.tree_flash_attention = _dense_tree_attention
         install_tree_attention(model)
         lp_expanded = _megatron_log_probs(model, _args(True), expanded)
-        lp_repacked = _megatron_log_probs(model, _args(True), expanded, _pack(expanded, PACK_BUDGET))
+        lp_repacked = _megatron_log_probs(model, _args(True), *_with_fillers(expanded))[1::2]
     else:
         lp_expanded = _megatron_log_probs(model, _args(False), expanded)
-        # noise floor: the same expanded samples, packed several per micro-batch
-        lp_repacked = _megatron_log_probs(model, _args(False), expanded, _pack(expanded, PACK_BUDGET))
+        # noise floor: the same expanded samples and implementation, other micro-batch composition
+        lp_repacked = _megatron_log_probs(model, _args(False), *_with_fillers(expanded))[1::2]
         install_tree_attention(model)
     lp_tree_by_tree = _megatron_log_probs(model, _args(True), trees)
     del model
@@ -266,8 +263,15 @@ def main():
         for k, v in (("tree", lp_tree), ("expanded", lp_expanded), ("repacked", lp_repacked), ("dense", lp_dense))
     }
 
-    def stats(a, b):
+    # which supervised tokens belong to an inline (last) turn and which to a branch
+    is_inline = torch.cat(
+        [torch.full((n,), j == 0) for t in trees for j, n in enumerate(t["turn_target_lens"])]
+    )
+
+    def stats(a, b, select=None):
         d = (flat[a] - flat[b]).abs()
+        if select is not None:
+            d = d[select]
         q = torch.tensor([0.5, 0.9, 0.99, 0.999])
         return {
             "max_abs": d.max().item(),
@@ -285,6 +289,8 @@ def main():
         "tree_tokens": sum(len(t["tokens"]) for t in trees),
         "expanded_tokens": sum(len(s["tokens"]) for s in expanded),
         "tree_vs_expanded": stats("tree", "expanded"),
+        "tree_vs_expanded_inline_turns": stats("tree", "expanded", is_inline),
+        "tree_vs_expanded_branch_turns": stats("tree", "expanded", ~is_inline),
         "expanded_vs_expanded_repacked (noise floor)": stats("repacked", "expanded"),
         "tree_vs_dense_hf": stats("tree", "dense"),
         "expanded_vs_dense_hf": stats("expanded", "dense"),

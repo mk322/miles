@@ -6,14 +6,19 @@ branch. Attention inside every segment is causal, and a branch additionally atte
 prefix of its tree's trunk (the keys ``[k_start, k_end)``): exactly the context the turn has at
 inference. Trunk tokens never see branches, and branches never see each other.
 
-The kernel is flash-attention 2 twice over, with no gathered or copied keys:
+The kernel is flash-attention 2, arranged so that every row runs exactly the arithmetic it runs
+in its standalone per-turn sample:
 
-* one causal varlen call over every segment of the micro-batch (``cu_seqlens``);
-* one non-causal call per branch, of its queries against a contiguous trunk prefix (a view).
+* one causal varlen call over every segment of the micro-batch (``cu_seqlens``) gives the trunk
+  and inline-target rows (a segment 0 is literally the last turn's standalone sample);
+* per branch, one causal call of its queries against its keys gathered as ``[trunk prefix;
+  branch]`` (bottom-right aligned): the key sequence of the branch's standalone sample, so its rows
+  are computed as in that sample, and overwrite what the segment call computed for them.
 
-The two partial softmaxes of a branch row are merged through their log-sum-exps. The backward
-pass hands both flash backward calls the *merged* output and log-sum-exp, which is what makes the
-gradient of each key subset the gradient of the full softmax (the ring-attention identity).
+Backward: the segment call's backward sees zero output-gradient on branch rows (so those rows
+contribute nothing to it: dS = P * (dP - D) = 0 exactly), and each branch's own call adds its dq
+and its key gradients, scattered back to the trunk prefix and the branch, summed in fp32 and
+rounded once. The gathered keys are rebuilt in backward, never saved.
 
 RoPE: the tree's position ids are not a function of ``cu_seqlens`` (a branch restarts at its attach
 point, not at 0), so in tree mode the model-level RoPE is switched off and ``TreeCoreAttention``
@@ -45,7 +50,8 @@ class TreeAttentionLayout:
     ``cu_seqlens`` (device int32) bounds the causal segments. ``cross`` holds, per branch, the host
     ints ``(q_start, q_end, k_start, k_end)``: rows ``[q_start, q_end)`` also see keys
     ``[k_start, k_end)``, all of them, on top of their causal segment. ``cross_cu_seqlens`` is the
-    device tensor ``[[0, q_end - q_start], [0, k_end - k_start]]`` per branch, built once.
+    device tensor ``[[0, q_len], [0, k_len + q_len]]`` per branch (``q_len = q_end - q_start``,
+    ``k_len = k_end - k_start``): the branch's queries and its ``[prefix; branch]`` keys, built once.
     """
 
     cu_seqlens: torch.Tensor
@@ -62,7 +68,9 @@ class TreeAttentionLayout:
         cross_cu = None
         if cross:
             cross_cu = torch.tensor(
-                [[[0, qe - qs], [0, ke - ks]] for qs, qe, ks, ke in cross], dtype=torch.int32, device=device
+                [[[0, qe - qs], [0, (ke - ks) + (qe - qs)]] for qs, qe, ks, ke in cross],
+                dtype=torch.int32,
+                device=device,
             )
         return TreeAttentionLayout(
             cu_seqlens=torch.tensor(cu_seqlens_host, dtype=torch.int32, device=device),
@@ -127,14 +135,10 @@ def _bwd(dout, q, k, v, out, lse, cu_q, cu_k, max_q, max_k, softmax_scale, causa
     return dq, dk, dv
 
 
-def _merge_into(out: torch.Tensor, lse: torch.Tensor, rows: slice, out2: torch.Tensor, lse2: torch.Tensor) -> None:
-    """Merge a second partial softmax ``(out2, lse2)`` into ``out[rows]``/``lse[:, rows]`` in place (fp32 math)."""
-    lse1 = lse[:, rows]
-    merged = torch.logaddexp(lse1, lse2)
-    w1 = torch.exp(lse1 - merged).transpose(0, 1).unsqueeze(-1)  # [rows, heads, 1]
-    w2 = torch.exp(lse2 - merged).transpose(0, 1).unsqueeze(-1)
-    out[rows] = (out[rows].float() * w1 + out2.float() * w2).to(out.dtype)
-    lse[:, rows] = merged
+def _branch_kv(k: torch.Tensor, v: torch.Tensor, branch: tuple[int, int, int, int]):
+    """A branch's standalone key/value sequence: ``[trunk prefix; branch]``."""
+    qs, qe, ks, ke = branch
+    return torch.cat((k[ks:ke], k[qs:qe])), torch.cat((v[ks:ke], v[qs:qe]))
 
 
 class _TreeFlashAttention(torch.autograd.Function):
@@ -142,10 +146,13 @@ class _TreeFlashAttention(torch.autograd.Function):
     def forward(ctx, q, k, v, layout: TreeAttentionLayout, softmax_scale: float, deterministic: bool):
         cu, max_len = layout.cu_seqlens, layout.max_seqlen
         out, lse = _fwd(q, k, v, cu, cu, max_len, max_len, softmax_scale, causal=True)
-        for i, (qs, qe, ks, ke) in enumerate(layout.cross):
+        for i, branch in enumerate(layout.cross):
+            qs, qe, ks, ke = branch
+            kb, vb = _branch_kv(k, v, branch)
             cu_q, cu_k = layout.cross_cu_seqlens[i, 0], layout.cross_cu_seqlens[i, 1]
-            out2, lse2 = _fwd(q[qs:qe], k[ks:ke], v[ks:ke], cu_q, cu_k, qe - qs, ke - ks, softmax_scale, causal=False)
-            _merge_into(out, lse, slice(qs, qe), out2, lse2)
+            out_b, lse_b = _fwd(q[qs:qe], kb, vb, cu_q, cu_k, qe - qs, kb.shape[0], softmax_scale, causal=True)
+            out[qs:qe] = out_b
+            lse[:, qs:qe] = lse_b
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.layout, ctx.softmax_scale, ctx.deterministic = layout, softmax_scale, deterministic
         return out
@@ -156,33 +163,44 @@ class _TreeFlashAttention(torch.autograd.Function):
         layout, scale, det = ctx.layout, ctx.softmax_scale, ctx.deterministic
         dout = dout.contiguous()
         cu, max_len = layout.cu_seqlens, layout.max_seqlen
-        dq, dk, dv = _bwd(dout, q, k, v, out, lse, cu, cu, max_len, max_len, scale, True, det)
         if not layout.cross:
+            dq, dk, dv = _bwd(dout, q, k, v, out, lse, cu, cu, max_len, max_len, scale, True, det)
             return dq, dk, dv, None, None, None
-        # A trunk key collects gradient from every branch that sees it: sum the parts in fp32 and
-        # round once, as a single kernel would, instead of rounding the running sum per branch.
-        dq, dk, dv = dq.float(), dk.float(), dv.float()
-        for i, (qs, qe, ks, ke) in enumerate(layout.cross):
+        # Branch rows were not produced by the segment call: give them no gradient there. With
+        # dO = 0 their dS is exactly 0 whatever out/lse hold, so they add nothing to dq, dk or dv.
+        dout_segments = dout.clone()
+        for qs, qe, _, _ in layout.cross:
+            dout_segments[qs:qe] = 0
+        dq, dk, dv = _bwd(dout_segments, q, k, v, out, lse, cu, cu, max_len, max_len, scale, True, det)
+        # A trunk key collects gradient from its segment and from every branch that sees it: sum
+        # the parts in fp32 and round once.
+        dk, dv = dk.float(), dv.float()
+        for i, branch in enumerate(layout.cross):
+            qs, qe, ks, ke = branch
+            kb, vb = _branch_kv(k, v, branch)
             cu_q, cu_k = layout.cross_cu_seqlens[i, 0], layout.cross_cu_seqlens[i, 1]
-            dq2, dk2, dv2 = _bwd(
+            dq_b, dk_b, dv_b = _bwd(
                 dout[qs:qe],
                 q[qs:qe],
-                k[ks:ke],
-                v[ks:ke],
+                kb,
+                vb,
                 out[qs:qe],
                 lse[:, qs:qe].contiguous(),
                 cu_q,
                 cu_k,
                 qe - qs,
-                ke - ks,
+                kb.shape[0],
                 scale,
-                False,
+                True,
                 det,
             )
-            dq[qs:qe] += dq2
-            dk[ks:ke] += dk2
-            dv[ks:ke] += dv2
-        return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), None, None, None
+            prefix = ke - ks
+            dq[qs:qe] = dq_b  # the segment call gave these rows exactly 0
+            dk[ks:ke] += dk_b[:prefix]
+            dk[qs:qe] += dk_b[prefix:]
+            dv[ks:ke] += dv_b[:prefix]
+            dv[qs:qe] += dv_b[prefix:]
+        return dq, dk.to(k.dtype), dv.to(v.dtype), None, None, None
 
 
 def tree_flash_attention(
@@ -214,18 +232,19 @@ def apply_rope_at_positions(
     return apply_rotary_pos_emb(t.unsqueeze(1), freqs, config=config).squeeze(1)
 
 
-class TreeCoreAttention(torch.nn.Module):
-    """Drop-in for a self-attention's ``core_attention`` that applies RoPE and tree attention.
+class TreeCoreAttention:
+    """The ``forward`` of a self-attention's ``core_attention`` under tree attention: RoPE, then tree attention.
 
-    ``rotary_emb`` is the model's ``RotaryEmbedding``: ``rotary_emb.get_emb(n)`` returns the angles
-    of positions ``[0, n)`` as ``[n, 1, 1, D_rot]``, before any CP sharding.
+    It is installed as the forward of the existing core-attention module rather than replacing the
+    module, so the model's parameters and state-dict keys (TE's ``_extra_state``) are exactly those
+    of the existing path and checkpoints load either way. ``rotary_emb`` is the model's
+    ``RotaryEmbedding``: ``rotary_emb.get_emb(n)`` returns the angles of positions ``[0, n)`` as
+    ``[n, 1, 1, D_rot]``, before any CP sharding.
     """
 
     def __init__(self, *, config, rotary_emb: torch.nn.Module, softmax_scale: float):
-        super().__init__()
-        # plain attributes, not submodules: the model owns them, and neither has parameters
-        object.__setattr__(self, "_rotary_emb", rotary_emb)
-        object.__setattr__(self, "_config", config)
+        self._rotary_emb = rotary_emb
+        self._config = config
         self.softmax_scale = softmax_scale
         # flash-attn's backward is deterministic only on request; ask exactly when TE would
         self.deterministic = (
@@ -233,7 +252,7 @@ class TreeCoreAttention(torch.nn.Module):
             or torch.are_deterministic_algorithms_enabled()
         )
 
-    def forward(
+    def __call__(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -300,7 +319,8 @@ def install_tree_attention(model: torch.nn.Module) -> None:
         if isinstance(module, SelfAttention):
             assert module.rotary_pos_emb is None, f"{name}: per-layer RoPE is not supported"
             assert module._yarn_concentration_factor == 1.0, f"{name}: RoPE mscale is not supported"
-            module.core_attention = TreeCoreAttention(
+            # nn.Module.__call__ dispatches to the instance attribute, hooks and all
+            module.core_attention.forward = TreeCoreAttention(
                 config=module.config, rotary_emb=rotary_emb, softmax_scale=softmax_scale
             )
             count += 1
