@@ -109,6 +109,13 @@ class PackedSeqParamsWithHostCuSeqlens(PackedSeqParams):
 
 
 def get_packed_seq_params(batch: dict[str, torch.Tensor], args: Namespace) -> PackedSeqParams:
+    if (tree_layout := batch.get("tree_layout")) is not None:
+        # imported here: tree_attention builds on this module (and needs flash_attn)
+        from miles.backends.megatron_utils.tree_attention import get_tree_packed_seq_params
+
+        packed_seq_params = get_tree_packed_seq_params(tree_layout)
+        batch["packed_seq_params"] = packed_seq_params
+        return packed_seq_params
     if args.qkv_format == "thd":
         packed_seq_params = PackedSeqParamsWithHostCuSeqlens(
             cu_seqlens_q=batch["cu_seqlens"],

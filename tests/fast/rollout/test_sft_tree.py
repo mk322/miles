@@ -207,9 +207,37 @@ def test_unrenderable_input_is_rejected(bad):
         validate_messages(bad)
 
 
-def test_leading_assistant_is_rejected(tok):
+@pytest.mark.parametrize(
+    "messages",
+    [
+        # after a <tool_response> user the template keeps earlier reasoning: not this packing's shape
+        [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "<think>r</think>a"},
+            {"role": "user", "content": "<tool_response>x</tool_response>"},
+            {"role": "assistant", "content": "b"},
+        ],
+        # a supervised turn right after another assistant turn (even an unsupervised one)
+        [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a", "loss": False},
+            {"role": "assistant", "content": "b"},
+        ],
+        [{"role": "assistant", "content": "a"}],
+        [{"role": "system", "content": "s"}, {"role": "assistant", "content": "a"}],
+    ],
+)
+def test_supervised_turn_must_follow_a_user_query(tok, messages):
     with pytest.raises(AssertionError):
-        build_turn_samples(tok, [{"role": "assistant", "content": "a"}], target_suffix=SUFFIX)
+        build_turn_samples(tok, messages, target_suffix=SUFFIX)
+
+
+def test_all_loss_false_trace_has_no_turns(tok):
+    messages = _conversation(["a", "b"], loss={0: False, 1: False})
+    turns = build_turn_samples(tok, messages, target_suffix=SUFFIX)
+    assert turns == []
+    trees, stats = build_trees(turns, max_context_len=32768, max_tree_tokens=32768)
+    assert trees == [] and stats.num_turns == 0 and stats.tree_tokens == 0
 
 
 # ---------------------------------------------------------------- trees

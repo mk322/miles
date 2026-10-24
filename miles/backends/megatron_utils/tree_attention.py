@@ -21,13 +21,16 @@ rotates q and k itself, in fp32, from explicit per-token position ids.
 """
 
 import logging
+import math
 from dataclasses import dataclass, field
 
 import torch
 from flash_attn.flash_attn_interface import _flash_attn_varlen_backward, _flash_attn_varlen_forward
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer.attention import SelfAttention
 
 from miles.backends.megatron_utils.parallel import PackedSeqParamsWithHostCuSeqlens
+from miles.backends.training_utils.data.sft_tree_layout import TreeBatchLayout
 
 logger = logging.getLogger(__name__)
 
@@ -256,3 +259,47 @@ class TreeCoreAttention(torch.nn.Module):
             deterministic=self.deterministic,
         )
         return out.reshape(out.shape[0], -1)
+
+
+def get_tree_packed_seq_params(host_layout: TreeBatchLayout) -> TreePackedSeqParams:
+    """Device-side packed params of one micro-batch's ``TreeBatchLayout`` (built by ``get_batch``)."""
+    device = torch.cuda.current_device()
+    layout = TreeAttentionLayout.build(host_layout.cu_seqlens, host_layout.cross, device)
+    cu = layout.cu_seqlens
+    return TreePackedSeqParams(
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu,
+        max_seqlen_q=layout.max_seqlen,
+        max_seqlen_kv=layout.max_seqlen,
+        qkv_format="thd",
+        cu_seqlens_host=host_layout.cu_seqlens,
+        total_tokens=host_layout.cu_seqlens[-1],
+        tree_layout=layout,
+        position_ids=torch.tensor(host_layout.positions, dtype=torch.long, device=device),
+        max_position=max(host_layout.positions),
+    )
+
+
+def install_tree_attention(model: torch.nn.Module) -> None:
+    """Switch one GPTModel chunk to tree attention: every self-attention's core attention, and RoPE.
+
+    The model-level RoPE is turned off (``position_embedding_type`` no longer ``'rope'``, so the
+    model passes ``rotary_pos_emb=None`` down) and ``TreeCoreAttention`` applies it from the batch's
+    explicit position ids instead, with the same ``RotaryEmbedding`` module.
+    """
+    assert model.position_embedding_type == "rope", f"tree attention needs RoPE, got {model.position_embedding_type}"
+    config = model.config
+    assert not config.multi_latent_attention and config.attention_dropout == 0.0
+    rotary_emb = model.rotary_pos_emb
+    softmax_scale = config.softmax_scale or 1.0 / math.sqrt(config.kv_channels)
+    count = 0
+    for name, module in model.named_modules():
+        if isinstance(module, SelfAttention):
+            assert module.rotary_pos_emb is None, f"{name}: per-layer RoPE is not supported"
+            module.core_attention = TreeCoreAttention(
+                rotary_emb=rotary_emb, softmax_scale=softmax_scale, deterministic=config.deterministic_mode
+            )
+            count += 1
+    assert count == len(model.decoder.layers), f"replaced {count} attentions for {len(model.decoder.layers)} layers"
+    model.position_embedding_type = "none"
+    logger.info(f"sft tree attention: replaced core attention and RoPE in {count} layers")

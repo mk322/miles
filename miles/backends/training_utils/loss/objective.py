@@ -125,9 +125,15 @@ def compute_advantages_and_returns(
     rollout_data["returns"] = returns
 
 
-def count_loss_tokens(loss_masks: list[torch.Tensor]) -> torch.Tensor:
-    """The per-token loss normalizer: supervised tokens, with a fully masked sample counting as one."""
-    return sum(torch.clamp_min(loss_mask.sum(), 1) for loss_mask in loss_masks)
+def count_loss_tokens(loss_masks: list[torch.Tensor], *, empty_sample_counts_as_one: bool = True) -> torch.Tensor:
+    """The per-token loss normalizer: supervised tokens, with a fully masked sample counting as one.
+
+    ``empty_sample_counts_as_one=False`` counts supervised tokens only: under --sft-tree-attention a
+    trace with no trainable turn becomes one fully masked placeholder sample (so the step still
+    consumes its trace), and it must not change the normalizer of the step's real tokens.
+    """
+    floor = 1 if empty_sample_counts_as_one else 0
+    return sum(torch.clamp_min(loss_mask.sum(), floor) for loss_mask in loss_masks)
 
 
 def loss_function(
@@ -169,7 +175,9 @@ def loss_function(
           Tinker losses may also return "per_datum" outputs.
     """
     parallel_state = get_parallel_state()
-    num_tokens = count_loss_tokens(batch["loss_masks"])
+    num_tokens = count_loss_tokens(
+        batch["loss_masks"], empty_sample_counts_as_one=not getattr(args, "sft_tree_attention", False)
+    )
     num_samples = len(batch["response_lengths"])
 
     sum_of_sample_mean = get_sum_of_sample_mean(

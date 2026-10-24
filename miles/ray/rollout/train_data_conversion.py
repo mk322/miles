@@ -47,6 +47,7 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "multimodal_train_inputs": ValueSpec(codec="ragged_tensor_dict"),
     "prompt": ValueSpec(codec="msgpack_ragged"),
     "metadata": ValueSpec(codec="msgpack_ragged"),
+    "tree_branches": ValueSpec(codec="msgpack_ragged"),
     "weight_versions": ValueSpec(codec="msgpack_ragged"),
     "raw_reward": ValueSpec(codec="auto"),
     "total_lengths": ValueSpec(codec="auto"),
@@ -195,6 +196,9 @@ def convert_samples_to_train_data(
 
     if samples[0].opd_reverse_kl is not None:
         train_data["opd_reverse_kl"] = [sample.opd_reverse_kl for sample in samples]
+
+    if any(sample.tree_branches for sample in samples):
+        train_data["tree_branches"] = [[list(b) for b in sample.tree_branches or ()] for sample in samples]
 
     x = metadata.get("dynamic_global_batch_size")
     assert args.use_dynamic_global_batch_size == (x is not None)
@@ -493,6 +497,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "loss_weights",
             "advantages",
             "target_tokens",
+            "tree_branches",
         ]:
             if key not in data:
                 continue

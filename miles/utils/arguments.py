@@ -638,6 +638,28 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sft-tree-attention",
+                action="store_true",
+                default=False,
+                help=(
+                    "Train multi-turn SFT traces packed as trees (miles.rollout.sft_tree): every supervised "
+                    "assistant turn sees exactly its inference prompt (the chat template's rendering of the "
+                    "messages before it), and a trace's turns share one trunk. Rollout functions that support "
+                    "it (examples/ota_sft) emit tree samples; the Megatron backend then replaces core "
+                    "attention and RoPE with tree attention. Off: every path is unchanged."
+                ),
+            )
+            parser.add_argument(
+                "--sft-tree-chat-template",
+                type=str,
+                default=None,
+                help=(
+                    "With --sft-tree-attention: the chat template file inference serves (e.g. the exported "
+                    "checkpoint's chat_template.jinja). Must be byte-identical to the --hf-checkpoint "
+                    "tokenizer's template, which is what the exported checkpoints carry."
+                ),
+            )
+            parser.add_argument(
                 "--indep-dp",
                 action="store_true",
                 default=False,
@@ -4230,6 +4252,9 @@ def miles_validate_args(args):
     if args.skip_actor_forward_only:
         validate_skip_actor_forward_only(args)
 
+    if args.sft_tree_attention:
+        validate_sft_tree_attention_args(args)
+
     validate_score_centering_args(args)
 
     _maybe_apply_dumper_overrides(args)
@@ -4241,6 +4266,17 @@ def miles_validate_args(args):
         raise ValueError("--mini-ft-controller-enable requires --api-server-port to be set (non-zero)")
 
     _validate_deploy_component(args)
+
+
+def validate_sft_tree_attention_args(args) -> None:
+    option = "--sft-tree-attention"
+    assert args.train_backend == "megatron", f"{option} only supports --train-backend megatron"
+    assert args.qkv_format == "thd", f"{option} needs --qkv-format thd"
+    assert args.context_parallel_size == 1, f"{option} does not support context parallelism"
+    assert not args.allgather_cp, f"{option} does not support --allgather-cp"
+    assert not args.mtp_num_layers, f"{option} does not support MTP"
+    assert args.attention_dropout == 0, f"{option} needs --attention-dropout 0"
+    assert args.sft_tree_chat_template is not None, f"{option} needs --sft-tree-chat-template"
 
 
 def validate_skip_actor_forward_only(args) -> None:

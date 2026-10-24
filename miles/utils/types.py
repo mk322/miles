@@ -196,6 +196,9 @@ class Sample:
     remove_sample: bool = False
     teacher_log_probs: list[float] | None = None  # Log probabilities from teacher model for OPD
     opd_reverse_kl: list[float] | None = None  # Precomputed per-token OPD reverse-KL estimate
+    # SFT tree packing (--sft-tree-attention): [(branch_len, prefix_len), ...] of the branches that end
+    # the sample; see miles.rollout.sft_tree. None means one ordinary causal sequence.
+    tree_branches: list[tuple[int, int]] | None = None
 
     class Status(Enum):
         PENDING = "pending"

@@ -202,6 +202,7 @@ def get_model_provider_func(
                 )
             assert not getattr(args, "enable_witness", False), "Witness is not supported yet in this mode"
             ModelCompanionInstallationUtils.install(model=model, chunk_index=vp_stage or 0)
+            _maybe_install_tree_attention(args, model)
             # Gemma-4 forward returns (logits, loss_mask); keep logits only.
             _bridge_forward = model.forward
 
@@ -342,10 +343,19 @@ def get_model_provider_func(
             model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
 
         _maybe_install_witness(args, model, vp_stage=vp_stage)
+        _maybe_install_tree_attention(args, model)
 
         return model
 
     return model_provider
+
+
+def _maybe_install_tree_attention(args: argparse.Namespace, model: GPTModel) -> None:
+    if getattr(args, "sft_tree_attention", False):
+        # imported here: it needs flash_attn, which runs without tree attention need not have
+        from miles.backends.megatron_utils.tree_attention import install_tree_attention
+
+        install_tree_attention(model)
 
 
 def _maybe_freeze_native_dsa_indexer(args: argparse.Namespace, model: GPTModel) -> None:

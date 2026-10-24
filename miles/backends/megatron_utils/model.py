@@ -333,6 +333,7 @@ def forward_only(
             "response_lengths",
             "max_seq_lens",
             "witness_ids",
+            "tree_branches",
         ]
         if use_rollout_sampling_mask:
             forward_only_keys.extend(["rollout_sampling_mask_ids", "rollout_sampling_mask_offsets"])
@@ -342,6 +343,7 @@ def forward_only(
             args.data_pad_size_multiplier,
             args.qkv_format,
             allgather_cp=args.allgather_cp,
+            sft_tree_attention=args.sft_tree_attention,
         )
         unconcat_tokens = batch["unconcat_tokens"]
         tokens = batch["tokens"]
@@ -484,11 +486,13 @@ def run_forward_backward_pass(
                 "loss_weights",
                 "target_tokens",
                 "sample_indices",
+                "tree_branches",
                 *sampling_mask_keys,
             ],
             args.data_pad_size_multiplier,
             args.qkv_format,
             allgather_cp=args.allgather_cp,
+            sft_tree_attention=args.sft_tree_attention,
         )
 
         if "adapter_token_counts" in batch:

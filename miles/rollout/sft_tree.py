@@ -98,6 +98,24 @@ def validate_messages(messages: Sequence[dict]) -> None:
             assert i == 0, f"message {i}: system message must be first"
 
 
+def _is_tool_response(content: str) -> bool:
+    return content.startswith("<tool_response>") and content.endswith("</tool_response>")
+
+
+def _assert_prompt_ends_with_query(messages: Sequence[dict], i: int) -> None:
+    """A supervised turn's prompt must end with a real user query.
+
+    The stock template's ``last_query_index`` is then the message right before the turn, so every
+    earlier assistant turn is rendered think-stripped: the shape this packing (and the trunk prefix
+    property) is meant for. A turn after a ``<tool_response>`` user, after another assistant, or with
+    no prompt at all is rejected.
+    """
+    assert i > 0, f"message {i}: a supervised assistant turn needs a prompt"
+    prev = messages[i - 1]
+    assert prev["role"] == "user", f"message {i}: a supervised turn must follow a user message, not {prev['role']}"
+    assert not _is_tool_response(prev["content"]), f"message {i}: follows a <tool_response> user message"
+
+
 def build_turn_samples(
     tokenizer, messages: Sequence[dict], *, target_suffix: str, chat_template: str | None = None
 ) -> list[TurnSample]:
@@ -110,8 +128,8 @@ def build_turn_samples(
     validate_messages(messages)
     history = [{"role": m["role"], "content": m["content"]} for m in messages]
     indices = [i for i, m in enumerate(messages) if m["role"] == "assistant" and m.get("loss", True)]
-    # inference never generates a turn without a prompt, and the template cannot render an empty one
-    assert not indices or indices[0] > 0, "a supervised assistant turn must follow at least one message"
+    for i in indices:
+        _assert_prompt_ends_with_query(history, i)
     if not indices:
         return []
     prompts = [

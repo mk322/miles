@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from miles.backends.training_utils.data.context_parallel import slice_log_prob_with_cp, slice_with_cp
 from miles.backends.training_utils.data.multimodal import expand_multimodal_rollout_data_in_place
+from miles.backends.training_utils.data.sft_tree_layout import build_tree_batch_layout
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.platforms import current_platform
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
@@ -176,6 +177,7 @@ def get_batch(
     qkv_format: str = "thd",
     get_position_ids: bool = False,
     allgather_cp: bool = False,
+    sft_tree_attention: bool = False,
 ) -> dict[str, torch.Tensor | list[torch.Tensor] | None]:
     """
     Generate a CP-ready micro-batch with packed sequence parameters.
@@ -197,12 +199,15 @@ def get_batch(
     - "packed_seq_params": PackedSeqParams with T-H-D settings (cu_seqlens on CUDA, dtype=int)
     - "input_loss_masks": same shape as "tokens"; 1 where the token is a supervised response token.
       Consumers that derive labels (Megatron with labels=None) shift it themselves.
+    - with ``sft_tree_attention``: "tree_layout", the host ``TreeBatchLayout`` of the packed trees
+      (samples without "tree_branches" are plain causal sequences).
     Plus any other requested keys forwarded from the iterator.
     """
 
     parallel_state = get_parallel_state()
 
     assert "tokens" in keys
+    assert not sft_tree_attention or (qkv_format == "thd" and not allgather_cp), "tree packing needs thd, no allgather CP"
     # get_batch consumes adapter_slots itself (per-adapter token counts below);
     # fetch it here so callers don't have to know. None for non-multi-LoRA runs.
     if "adapter_slots" not in keys:
@@ -286,6 +291,12 @@ def get_batch(
             if pad != 0:
                 tokens = F.pad(tokens, (0, pad), value=pad_token_id)
                 cu_seqlens.append(cu_seqlens[-1] + pad)
+
+            if sft_tree_attention:
+                assert cp_size == 1, "--sft-tree-attention does not support context parallelism"
+                batch["tree_layout"] = build_tree_batch_layout(
+                    sample_token_lengths, batch.get("tree_branches") or [None] * len(sample_token_lengths), pad
+                )
 
             # thd requires the cu_seqlens to be of the origin length
             cu_seqlens_host = tuple(boundary * cp_size for boundary in cu_seqlens)
