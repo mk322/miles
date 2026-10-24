@@ -1,0 +1,5 @@
+# Miles image for A100 (sm80), runnable as a non-root user.
+# TE prefers flash-attn-4 whenever it is installed, but FA4's backward asserts sm90+, and cuDNN
+# fused attention rejects the THD layout on sm80; removing FA4 leaves FA2, which works.
+FROM radixark/miles:v0.1.3
+RUN pip uninstall -y flash-attn-4 && chmod -R a+rwX /root
