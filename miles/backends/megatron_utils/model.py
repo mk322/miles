@@ -343,7 +343,7 @@ def forward_only(
             args.data_pad_size_multiplier,
             args.qkv_format,
             allgather_cp=args.allgather_cp,
-            sft_tree_attention=args.sft_tree_attention,
+            sft_tree_attention=getattr(args, "sft_tree_attention", False),
         )
         unconcat_tokens = batch["unconcat_tokens"]
         tokens = batch["tokens"]
@@ -492,7 +492,7 @@ def run_forward_backward_pass(
             args.data_pad_size_multiplier,
             args.qkv_format,
             allgather_cp=args.allgather_cp,
-            sft_tree_attention=args.sft_tree_attention,
+            sft_tree_attention=getattr(args, "sft_tree_attention", False),
         )
 
         if "adapter_token_counts" in batch:

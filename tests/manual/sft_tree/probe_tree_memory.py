@@ -77,8 +77,8 @@ def main():
         share_embeddings_and_output_weights=False, parallel_output=True,
     ).cuda()
     install_tree_attention(model)
-    for prm in model.parameters():
-        prm.grad = torch.zeros_like(prm, dtype=torch.float32)  # stands in for main_grad buffers
+    # stand-ins for Megatron's fp32 main_grad buffers (static memory; the probe measures what is above it)
+    main_grads = [torch.zeros_like(prm, dtype=torch.float32) for prm in model.parameters()]  # noqa: F841
 
     seg0, branches = _tree(args.tokens) if not args.plain else (args.tokens, [])
     total = seg0 + sum(b for b, _ in branches)

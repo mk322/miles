@@ -245,7 +245,12 @@ def _step(model, args, samples, micro_batches):
             if p.grad is not None:
                 grads[n] = grads.get(n, 0) + p.grad.float()
                 p.grad = None
-    # Megatron's per-token finalize: grads (summed over micro-batches) / the step's total num_tokens
+    # Megatron's finalize: sequence-parallel params (norms) hold per-rank partial grads over that
+    # rank's tokens; all-reduce them over TP, then divide by the step's total num_tokens
+    params = dict(model.named_parameters())
+    for n, g in grads.items():
+        if getattr(params[n], "sequence_parallel", False):
+            dist.all_reduce(g, group=parallel_state.get_tensor_model_parallel_group())
     grads = {n: g / num_tokens for n, g in grads.items()}
     return log_probs, loss_sum / num_tokens, num_tokens, grads
 

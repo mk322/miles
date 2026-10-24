@@ -145,6 +145,7 @@ def _merge_sample_pair(a: Sample, b: Sample, tokenizer) -> Sample:
             assert b.rollout_indexer_topk is not None, "cannot merge: a has rollout_indexer_topk but b does not"
             assert a.rollout_indexer_topk.shape[0] <= b.rollout_indexer_topk.shape[0]
         assert a.status == Sample.Status.COMPLETED, f"a.status must be COMPLETED, got {a.status}"
+        assert a.tree_branches is None and b.tree_branches is None, "cannot merge SFT tree samples"
 
         return _create_with_all_fields(
             Sample,
@@ -171,6 +172,7 @@ def _merge_sample_pair(a: Sample, b: Sample, tokenizer) -> Sample:
             rollout_sampling_mask=sampling_mask,
             teacher_log_probs=_merge_optional_per_token("teacher_log_probs"),
             opd_reverse_kl=_merge_optional_per_token("opd_reverse_kl"),
+            tree_branches=None,
             rollout_routed_experts=b.rollout_routed_experts,
             rollout_indexer_topk=b.rollout_indexer_topk,
             remove_sample=_merge_equal_value("remove_sample"),

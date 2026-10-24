@@ -292,6 +292,7 @@ def main():
         "tree_vs_expanded_inline_turns": stats("tree", "expanded", is_inline),
         "tree_vs_expanded_branch_turns": stats("tree", "expanded", ~is_inline),
         "expanded_vs_expanded_repacked (noise floor)": stats("repacked", "expanded"),
+        "tree_vs_expanded_repacked": stats("tree", "repacked"),
         "tree_vs_dense_hf": stats("tree", "dense"),
         "expanded_vs_dense_hf": stats("expanded", "dense"),
         "mean_nll": {k: -v.mean().item() for k, v in flat.items()},
