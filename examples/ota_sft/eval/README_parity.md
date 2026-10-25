@@ -5,7 +5,8 @@ kwargs:
 
 - `datagen_parity: true`: terminus-2 sends the model the same prompts as the
   2026-04 harness that generated OpenThoughts-Agent-SFT-10K. You need the harbor-marin
-  branch `datagen-parity` checked out in `/data/murray/ota_sft/src/harbor-marin`.
+  branch `datagen-parity` (github.com/mk322/harbor) checked out at `$HARBOR_SRC` and installed
+  editable into `$OTA_ROOT/venvs/harbor`.
 - `proactive_summarization_threshold: 8000`: the datagen default. The base yaml uses
   2048.
 
@@ -28,8 +29,8 @@ With the switch on, the model sees:
 observation formats, warnings, completion confirmation, and the question, answers and
 handoff prompts were already identical, and they are unchanged.
 
-`run_eval.sh` always reads `terminus2_local_docker.yaml`. To use the parity config,
-point `--config` at a runtime copy of this file. Alternatively, keep `run_eval.sh` and
+`run_eval.sh` reads `terminus2_local_docker.yaml` unless `CONFIG` names another yaml. To use the parity config,
+run `CONFIG=$PWD/terminus2_local_docker_parity.yaml ./run_eval.sh ...`, or queue checkpoints with `eval_queue.py --priority-queue TAG:RUN_DIR:terminus2_local_docker_parity.yaml:STEPS`. Alternatively,
 pass the two kwargs through it:
 
 ```bash

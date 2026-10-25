@@ -1,10 +1,14 @@
 """Start `run_qwen3_8b_ota_sft.py train` inside the Miles image on this box.
 
 Mounts this checkout over the image's miles path, the model/dataset/run dirs under OTA_ROOT,
-and forwards WANDB_API_KEY (from the environment, else ~/.netrc) so runs report to the
-caller's W&B account. The container runs as the calling user, not root, so run files stay
-owned by them. On sm80 (A100) use the image from `docker/Dockerfile.sm80` (the default), which
-drops flash-attn-4 and makes /root writable; build it once with:
+and forwards WANDB_API_KEY (from the environment, else ~/.netrc) so runs report to that key's
+W&B account. The container runs as the calling user, not root, so run files stay owned by them.
+
+Machine-specific values come from the environment (see examples/ota_sft/site/): OTA_ROOT, and
+MILES_IMAGE (default miles-ota:v0.1.3-sm80). The container runs as a non-root user, so `/root`
+must be writable. `docker/Dockerfile.sm80` makes it writable and also removes flash-attn-4, whose
+backward needs sm90+. Build it once; it is required on A100 and works on H100. Tree attention calls
+flash-attn 2 directly on both:
 
   docker build -t miles-ota:v0.1.3-sm80 -f examples/ota_sft/docker/Dockerfile.sm80 examples/ota_sft/docker
 
@@ -21,7 +25,6 @@ import shlex
 import subprocess
 from pathlib import Path
 
-_IMAGE = "miles-ota:v0.1.3-sm80"
 _REPO = Path(__file__).resolve().parents[2]
 
 
@@ -39,8 +42,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--name", required=True)
     parser.add_argument("--gpus", required=True, help="comma-separated device ids")
-    parser.add_argument("--ota-root", default="/data/murray/ota_sft")
-    parser.add_argument("--image", default=_IMAGE)
+    parser.add_argument("--ota-root", default=os.environ.get("OTA_ROOT"), required="OTA_ROOT" not in os.environ)
+    parser.add_argument("--image", default=os.environ.get("MILES_IMAGE", "miles-ota:v0.1.3-sm80"))
     parser.add_argument("train_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 

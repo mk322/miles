@@ -7,8 +7,8 @@ as ``broken_data``. Row order is preserved, since OpenThoughts-Agent trains with
 
 Usage:
   python examples/ota_sft/prepare_data.py \
-      --src /data/murray/ota_sft/datasets/OpenThoughts-Agent-SFT-10K \
-      --dst /data/murray/ota_sft/datasets/ota_sft_10k.jsonl
+      --src $OTA_ROOT/datasets/OpenThoughts-Agent-SFT-10K \
+      --dst $OTA_ROOT/datasets/ota_sft_10k.jsonl
 """
 
 import argparse

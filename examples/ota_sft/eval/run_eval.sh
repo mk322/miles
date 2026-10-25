@@ -3,17 +3,19 @@
 # OpenAI-compatible endpoint, mirroring OpenThoughts-Agent/eval/jupiter/eval_harbor.sbatch.
 #
 # Usage: run_eval.sh <swebench|tb2> <served_model_name> [extra harbor args...]
-# Env:   OTA_ROOT (default /data/murray/ota_sft), API_BASE (default http://localhost:8000/v1),
-#        AGENT_KWARGS (newline-separated extra --agent-kwarg values), JOB_NAME.
+# Env:   OTA_ROOT (required; holds datasets/, eval_jobs/ and venvs/harbor), API_BASE (default http://localhost:8000/v1),
+#        AGENT_KWARGS (newline-separated extra --agent-kwarg values), JOB_NAME,
+#        CONFIG (agent yaml, default terminus2_local_docker.yaml next to this script).
 set -euo pipefail
 
 BENCH="${1:?bench: swebench|tb2}"
 MODEL="${2:?served model name}"
 shift 2
 
-OTA_ROOT="${OTA_ROOT:-/data/murray/ota_sft}"
+OTA_ROOT="${OTA_ROOT:?set OTA_ROOT (see examples/ota_sft/site/)}"
 API_BASE="${API_BASE:-http://localhost:8000/v1}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG="${CONFIG:-$HERE/terminus2_local_docker.yaml}"
 
 # Presets follow OpenThoughts-Agent/eval/presets/{swebench,tb2}.yaml.
 case "$BENCH" in
@@ -29,7 +31,7 @@ mkdir -p "$JOBS_DIR"
 # The sbatch injects model_name = hosted_vllm/<model> into a runtime copy of the yaml.
 RUNTIME_CFG="$JOBS_DIR/$JOB_NAME.config.yaml"
 sed "s#model_name: hosted_vllm/.*#model_name: hosted_vllm/${MODEL}#; s#metrics_endpoint: .*#metrics_endpoint: ${API_BASE%/v1}/metrics#" \
-  "$HERE/terminus2_local_docker.yaml" > "$RUNTIME_CFG"
+  "$CONFIG" > "$RUNTIME_CFG"
 
 CMD=(
   "$OTA_ROOT/venvs/harbor/bin/harbor" jobs start

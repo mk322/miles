@@ -37,8 +37,9 @@ Row order is preserved (OpenThoughts-Agent trains with ``disable_shuffling=True`
 
 Usage:
   python examples/ota_sft/prepare_data_aligned.py \
-      --src /data/murray/ota_sft/datasets/OpenThoughts-Agent-SFT-10K \
-      --dst /data/murray/ota_sft/datasets/ota_sft_10k_aligned.jsonl
+      --src $OTA_ROOT/datasets/OpenThoughts-Agent-SFT-10K \
+      --dst $OTA_ROOT/datasets/ota_sft_10k_aligned.jsonl
+(HARBOR_SRC must point at the Harbor checkout; the env files under examples/ota_sft/site/ set both.)
 """
 
 import argparse
@@ -89,12 +90,9 @@ def strip_system_warnings(content: str) -> tuple[str, int]:
 # ``Terminus2._handle_llm_interaction`` / ``_run_agent_loop``; the strings below are that code's
 # literals (checked against a live harness run by the tests).
 
-HARBOR_JSON_PARSER = Path(
-    os.environ.get(
-        "HARBOR_JSON_PARSER",
-        "/data/murray/ota_sft/src/harbor-marin/src/harbor/agents/terminus_2/terminus_json_plain_parser.py",
-    )
-)
+# The Harbor checkout (branch datagen-parity) the evaluation runs; see examples/ota_sft/site/.
+HARBOR_SRC = Path(os.environ.get("HARBOR_SRC", "harbor-src-not-set"))
+HARBOR_JSON_PARSER = HARBOR_SRC / "src/harbor/agents/terminus_2/terminus_json_plain_parser.py"
 PARSE_ERROR_PREFIX = "Previous response had parsing errors:\n"
 PARSE_ERROR_SUFFIX = "\n\nPlease fix these issues and provide a proper JSON response."
 WARNINGS_PREFIX = "Previous response had warnings:\n"

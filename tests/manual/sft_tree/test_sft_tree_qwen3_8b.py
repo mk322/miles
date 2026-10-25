@@ -15,6 +15,7 @@ Needs one GPU with ~60 GB free and the checkpoint/data paths below (not run in C
 
 import json
 import os
+from pathlib import Path
 import sys
 from argparse import Namespace
 from datetime import timedelta
@@ -36,10 +37,10 @@ from miles.rollout.sft_tree import build_trees, build_turn_samples, expand_tree
 from miles.utils.ft_utils.process_group_utils import GroupInfo
 
 HF = os.environ.get("QWEN3_8B", "/root/models/Qwen3-8B")
-DATA = os.environ.get("TREE_SAMPLE", "/root/dev/aligned_sample.jsonl")
-TEMPLATE = os.environ.get("CHAT_TEMPLATE", "/root/dev/chat_template_step664.jinja")
+DATA = os.environ.get("TREE_SAMPLE", "/root/datasets/ota_sft_10k_aligned_sample.jsonl")
+TEMPLATE = os.environ.get("CHAT_TEMPLATE", str(Path(__file__).resolve().parents[3] / "examples/ota_sft/qwen3_chat_template.jinja"))
 ROWS = [int(x) for x in os.environ.get("TREE_ROWS", "0,1,3,13,22,27").split(",")]
-OUT = os.environ.get("TREE_OUT", "/root/dev/qwen3_8b_logprob_equivalence.json")
+OUT = os.environ.get("TREE_OUT", "/tmp/qwen3_8b_logprob_equivalence.json")
 # fp32: fp32 weights and exact (fp64 dense masked) attention in every path, on traces cut to their
 # first TREE_TRUNCATE messages so dense attention fits; isolates the tree construction from bf16 noise
 FP32 = os.environ.get("TREE_PRECISION", "bf16") == "fp32"

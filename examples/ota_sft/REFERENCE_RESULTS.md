@@ -1,7 +1,7 @@
 # OpenThoughts-Agent (OTA) reference results
 
 Source: *OpenThoughts-Agent: Data Recipes for Agentic Models*, arXiv:2606.24855v1 (2026-06-23).
-Local PDF: `/data/murray/ota_sft/ota_paper_2606.24855v1.pdf`.
+https://arxiv.org/abs/2606.24855
 Numbers are accuracy (%), pass@1 averaged over 3 runs; the subscript in the paper is the standard error (shown here as ±).
 
 ## Target to reproduce: Qwen3-8B + OpenThoughts-Agent-SFT-10K

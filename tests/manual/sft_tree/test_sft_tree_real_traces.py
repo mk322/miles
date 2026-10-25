@@ -15,6 +15,7 @@ Full-dataset verification (all 122389 turns of the aligned file) is ``examples/o
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 from transformers import AutoTokenizer
@@ -23,8 +24,8 @@ from miles.rollout.sft_tree import build_trees, build_turn_samples
 from tests.fast.rollout.test_sft_tree import check_tree
 
 TOKENIZER = os.environ.get("QWEN3_8B", "/root/models/Qwen3-8B")
-TEMPLATE = os.environ.get("CHAT_TEMPLATE", "/root/dev/chat_template_step664.jinja")
-ALIGNED_SAMPLE = os.environ.get("TREE_SAMPLE", "/root/dev/aligned_sample.jsonl")
+TEMPLATE = os.environ.get("CHAT_TEMPLATE", str(Path(__file__).resolve().parents[3] / "examples/ota_sft/qwen3_chat_template.jinja"))
+ALIGNED_SAMPLE = os.environ.get("TREE_SAMPLE", "/root/datasets/ota_sft_10k_aligned_sample.jsonl")
 LF_PARITY = os.environ.get("OTA_JSONL", "/root/datasets/ota_sft_10k.jsonl")
 SUFFIX = "<|im_end|>\n"
 

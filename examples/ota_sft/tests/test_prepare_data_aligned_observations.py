@@ -15,6 +15,7 @@ import asyncio
 import collections
 import glob
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -37,7 +38,7 @@ from examples.ota_sft.prepare_data_aligned import (
     split_observation,
 )
 
-SNAPSHOT = Path("/data/murray/ota_sft/datasets/OpenThoughts-Agent-SFT-10K")
+SNAPSHOT = Path(os.environ.get("OTA_ROOT", "ota-root-not-set")) / "datasets/OpenThoughts-Agent-SFT-10K"
 pytestmark = pytest.mark.skipif(not HARBOR_JSON_PARSER.exists(), reason="Harbor checkout not available")
 
 TERM = "New Terminal Output:\n$ ls\nfile\n$ "

@@ -6,8 +6,8 @@ trials trips Docker Hub's anonymous rate limit (HTTP 429), which Harbor records 
 trial (reward 0). Pull them once, ahead of the eval, so trials only hit the local cache.
 
 Usage:
-  python examples/ota_sft/eval/prepull_images.py /data/murray/ota_sft/datasets/swebench-verified-random-100-folders \
-      /data/murray/ota_sft/datasets/terminal_bench_2 --jobs 8
+  python examples/ota_sft/eval/prepull_images.py $OTA_ROOT/datasets/swebench-verified-random-100-folders \
+      $OTA_ROOT/datasets/terminal_bench_2 --jobs 8
 """
 
 import argparse

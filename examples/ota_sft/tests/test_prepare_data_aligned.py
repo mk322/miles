@@ -5,11 +5,14 @@ Run: python -m pytest examples/ota_sft/tests/test_prepare_data_aligned.py -q
 """
 
 import glob
+import os
 from pathlib import Path
 
 import pytest
 
 from examples.ota_sft.prepare_data_aligned import (
+    HARBOR_JSON_PARSER,
+    HARBOR_SRC,
     NEW_NEWLINE_RULE,
     OLD_NEWLINE_RULE,
     convert_rows,
@@ -18,8 +21,10 @@ from examples.ota_sft.prepare_data_aligned import (
     strip_system_warnings,
 )
 
-SNAPSHOT = Path("/data/murray/ota_sft/datasets/OpenThoughts-Agent-SFT-10K")
-HARBOR_TEMPLATE = Path("/data/murray/ota_sft/src/harbor-marin/src/harbor/agents/terminus_2/templates/terminus-json-plain.txt")
+SNAPSHOT = Path(os.environ.get("OTA_ROOT", "ota-root-not-set")) / "datasets/OpenThoughts-Agent-SFT-10K"
+HARBOR_TEMPLATE = HARBOR_SRC / "src/harbor/agents/terminus_2/templates/terminus-json-plain.txt"
+# convert_rows parses every assistant turn with Harbor's own JSON parser
+needs_harbor = pytest.mark.skipif(not HARBOR_JSON_PARSER.exists(), reason="Harbor checkout not available (set HARBOR_SRC)")
 TIME_W = (
     "[SYSTEM WARNING] You have approximately 5 minutes remaining before the task times out. "
     "Please wrap up your work and finalize your solution as soon as possible."
@@ -101,6 +106,7 @@ def test_strip_warnings_rejects_unexpected_shapes(content):
 # ---------------------------------------------------------------- row conversion
 
 
+@needs_harbor
 def test_turn_after_warning_is_unsupervised_and_only_that_turn():
     out, stats = convert_rows(
         [_row(("user", "sys"), ("assistant", "a1"), ("user", f"{TIME_W}\n\nobs"), ("assistant", "a2"), ("user", "o"), ("assistant", "a3"))]
@@ -111,12 +117,14 @@ def test_turn_after_warning_is_unsupervised_and_only_that_turn():
     assert stats["warnings_stripped"] == 1 and stats["turns_after_warning_unsupervised"] == 1
 
 
+@needs_harbor
 def test_warning_in_any_user_message_since_last_turn_unsupervises_it():
     # user(warned) then user(clean) then assistant: the assistant still read the warned message
     out, _ = convert_rows([_row(("user", "sys"), ("user", f"{TIME_W}\n\nobs"), ("user", "p"), ("assistant", "a"), ("user", "o"), ("assistant", "b"))])
     assert [m.get("loss", True) for m in out[0]["messages"] if m["role"] == "assistant"] == [False, True]
 
 
+@needs_harbor
 def test_non_alternating_rows_are_kept_verbatim():
     rows = [_row(("user", "sys"), ("user", "You are picking up work"), ("assistant", "<think>q</think>Q"), ("user", "h"), ("assistant", "a"))]
     out, stats = convert_rows(rows)
@@ -126,6 +134,7 @@ def test_non_alternating_rows_are_kept_verbatim():
     assert stats["non_alternating_rows"] == 1
 
 
+@needs_harbor
 def test_duplicate_turns_supervised_once():
     hist = [("user", "sys"), ("assistant", "<think>r1</think>a1"), ("user", "o1")]
     rows = [
@@ -138,6 +147,7 @@ def test_duplicate_turns_supervised_once():
     assert stats["duplicate_turns_unsupervised"] == 2
 
 
+@needs_harbor
 def test_duplicate_detection_uses_the_rendered_context():
     # identical after think stripping -> same rendered prompt -> same sample; different target -> distinct
     a = _row(("user", "u"), ("assistant", "<think>x</think>A"), ("user", "o"), ("assistant", "T"))
@@ -149,6 +159,7 @@ def test_duplicate_detection_uses_the_rendered_context():
     assert out[2]["messages"][3].get("loss", True) is True
 
 
+@needs_harbor
 def test_unclosed_think_history_is_not_stripped_for_dedup():
     a = _row(("user", "u"), ("assistant", "<think>x"), ("user", "o"), ("assistant", "T"))
     b = _row(("user", "u"), ("assistant", "<think>y"), ("user", "o"), ("assistant", "T"))
@@ -156,6 +167,7 @@ def test_unclosed_think_history_is_not_stripped_for_dedup():
     assert out[1]["messages"][3].get("loss", True) is True  # contexts differ: unclosed think stays verbatim
 
 
+@needs_harbor
 def test_order_and_metadata_preserved():
     rows = [_row(("user", str(i)), ("assistant", "a"), task=f"t{i}") for i in range(5)]
     out, _ = convert_rows(rows)
@@ -163,6 +175,7 @@ def test_order_and_metadata_preserved():
     assert [r["metadata"]["task"] for r in out] == [f"t{i}" for i in range(5)]
 
 
+@needs_harbor
 def test_rejects_unknown_role():
     with pytest.raises(AssertionError):
         convert_rows([_row(("user", "u"), ("tool", "x"), ("assistant", "a"))])

@@ -19,8 +19,9 @@ Matches the OpenThoughts-Agent code (LlamaFactory fork mlfoundations/llama-facto
     `--clip-grad 1e-4 --weight-decay 0` to run the yaml values.
 
 Recipes (`--finetune-type`):
-  * full: full-parameter SFT at the paper's lr 4e-5, TP4 so the fp32 master weights and Adam
-    state fit on 4 x 80GB.
+  * full: full-parameter SFT at the paper's lr 4e-5, TP2 (with the distributed optimizer the fp32
+    master weights and Adam state fit on 4 x 80GB at TP2 x DP2; keep TP inside an NVLink domain,
+    TP4 across PCIe was 5x slower per step).
   * lora: Megatron-Bridge PEFT, rank 64 / alpha 128 on all linear layers, lr 4e-4 (10x full).
 
 Other differences: the step count is `7 * n_rows // 96` (Miles wraps batches across epochs)
@@ -44,8 +45,9 @@ Args:
   --attention-backend: Megatron attention backend (default flash; on A100 use docker/Dockerfile.sm80).
   --data-file: the jsonl under --data-dir (default the LF-parity ota_sft_10k.jsonl).
   --sft-tree-attention: train every assistant turn against its inference prompt (stock chat template,
-      earlier turns think-stripped) with tree packing; see miles/rollout/sft_tree.py. Needs
-      --chat-template, the template the eval server uses (an exported checkpoint's chat_template.jinja).
+      earlier turns think-stripped) with tree packing; see miles/rollout/sft_tree.py.
+  --chat-template: the template the eval server renders with. Default: qwen3_chat_template.jinja,
+      Qwen3-8B's own template, byte-identical to the chat_template.jinja our HF exports ship.
       A step still consumes --global-batch-size traces, however many trees they become.
 
 =====================
@@ -55,10 +57,9 @@ Args:
   python examples/ota_sft/run_qwen3_8b_ota_sft.py train --finetune-type full
   # 4x A100 80GB (tuned: ~144 s/step, 73 GB peak), via examples/ota_sft/docker_train.py:
   python examples/ota_sft/run_qwen3_8b_ota_sft.py train --finetune-type lora --recompute-method block --recompute-num-layers 22
-  # inference-aligned tree attention:
+  # inference-aligned tree attention (10,000 rows // 96 = 104 steps per epoch, saved every epoch):
   python examples/ota_sft/run_qwen3_8b_ota_sft.py train --finetune-type full --sft-tree-attention \
-      --data-file ota_sft_10k_aligned.jsonl --save-interval 104 \
-      --chat-template /root/shared_data/ota_lora_r64_lr4e-4/hf/step_664/chat_template.jinja
+      --data-file ota_sft_10k_aligned.jsonl --save-interval 104
 """
 
 from dataclasses import dataclass
@@ -84,7 +85,7 @@ class _Recipe:
 
 _RECIPES: dict[str, _Recipe] = {
     "lora": _Recipe(lr=4e-4, tensor_model_parallel_size=2, use_lora=True),
-    "full": _Recipe(lr=4e-5, tensor_model_parallel_size=4, use_lora=False),
+    "full": _Recipe(lr=4e-5, tensor_model_parallel_size=2, use_lora=False),
 }
 
 
@@ -185,8 +186,8 @@ def _train(args: ScriptArgs):
         "--debug-train-only "
     )
     if args.sft_tree_attention:
-        assert args.chat_template, "--sft-tree-attention needs --chat-template (the template inference serves)"
-        sft_args += f"--sft-tree-attention --sft-tree-chat-template {args.chat_template} "
+        chat_template = args.chat_template or f"{U.repo_base_dir}/examples/ota_sft/qwen3_chat_template.jinja"
+        sft_args += f"--sft-tree-attention --sft-tree-chat-template {chat_template} "
 
     perf_args = (
         f"--tensor-model-parallel-size {tp_size} "
